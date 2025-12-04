@@ -1,0 +1,5 @@
+{
+  "name": "Graph Wars: Metro Style",
+  "description": "A minimalist, turn-based strategy game inspired by transport simulators. Command nodes, manage unit fusion, and survive catastrophes.",
+  "requestFramePermissions": []
+}
