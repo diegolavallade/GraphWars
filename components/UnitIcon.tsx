@@ -19,7 +19,8 @@ export const UnitIcon: React.FC<UnitIconProps> = ({ type, color, size = 16, clas
   if (type === 'horse') {
     return (
       <svg width={size} height={size} viewBox="0 0 24 24" fill={color} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-        <polygon points="12 2 15 22 12 18 9 22 12 2" />
+         {/* Wider, knight-like shape */}
+        <path d="M19 19c0-1.5-1-2-2-3s-1.5-2-1.5-4c0-3.5 1.5-5 3-6.5-2.5 0-5 1.5-6 4-1-1.5-1-3-1-3s-2 0-3 1.5c-.5 1-1 3.5 0 5 .5 1 1 2 1.5 2.5 0 0-1.5 1-1.5 2.5 0 1.5 1.5 2 2.5 2h8z" />
       </svg>
     );
   }

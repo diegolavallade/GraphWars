@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { GameState, Player, Territory, UnitType, PlayerId, LogEntry } from './types';
-import { MAP_POSITIONS, EDGES, COLORS } from './constants';
+import { GameState, Player, Territory, UnitType, PlayerId, LogEntry, Coordinate } from './types';
+import { MAP_POSITIONS as INITIAL_POSITIONS, EDGES, COLORS } from './constants';
 import { UnitIcon } from './components/UnitIcon';
+import { playSound } from './sound';
+import { AnnouncementOverlay, CombatResult, CatastropheResult } from './components/AnnouncementOverlay';
 import { 
   Shield, 
   Swords, 
@@ -19,7 +21,8 @@ import {
   ScrollText,
   X,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Flag
 } from 'lucide-react';
 
 // --- GAME LOGIC HELPERS ---
@@ -30,7 +33,7 @@ const getTotalPower = (t: Territory) => t.troops.peon + (t.troops.horse * 5) + (
 
 const createInitialState = (vsAI: boolean, catastropheInterval: number): GameState => {
   const territories: Record<string, Territory> = {};
-  Object.keys(MAP_POSITIONS).forEach(node => {
+  Object.keys(INITIAL_POSITIONS).forEach(node => {
     territories[node] = {
       id: node,
       owner: null,
@@ -55,6 +58,74 @@ const createInitialState = (vsAI: boolean, catastropheInterval: number): GameSta
   };
 };
 
+// --- PHYSICS ENGINE ---
+const useNodePhysics = (territories: Record<string, Territory>) => {
+    const [positions, setPositions] = useState(INITIAL_POSITIONS);
+
+    useEffect(() => {
+        let currentPos = { ...INITIAL_POSITIONS };
+        const iterations = 40; 
+        const kRepulse = 800; 
+        const kAttract = 0.05; 
+        const padding = 20;
+
+        const getRadius = (id: string) => {
+            const power = territories[id] ? getTotalPower(territories[id]) : 0;
+            return 20 + Math.min(power, 20);
+        };
+
+        const nodes = Object.keys(currentPos);
+        let calculatedPos = JSON.parse(JSON.stringify(currentPos));
+
+        for (let it = 0; it < iterations; it++) {
+            const newStepPos = { ...calculatedPos };
+            let moved = false;
+
+            for (let i = 0; i < nodes.length; i++) {
+                const idA = nodes[i];
+                const posA = calculatedPos[idA];
+                const radiusA = getRadius(idA);
+                const anchor = INITIAL_POSITIONS[idA];
+                let vx = (anchor.x - posA.x) * kAttract;
+                let vy = (anchor.y - posA.y) * kAttract;
+
+                for (let j = 0; j < nodes.length; j++) {
+                    if (i === j) continue;
+                    const idB = nodes[j];
+                    const posB = calculatedPos[idB];
+                    const radiusB = getRadius(idB);
+                    const dx = posA.x - posB.x;
+                    const dy = posA.y - posB.y;
+                    const distSq = dx * dx + dy * dy;
+                    const dist = Math.sqrt(distSq);
+                    const minDist = radiusA + radiusB + padding;
+
+                    if (dist < minDist && dist > 0) {
+                        const overlap = minDist - dist;
+                        const force = (overlap * kRepulse) / (distSq + 1); 
+                        const nx = dx / dist;
+                        const ny = dy / dist;
+                        vx += nx * force;
+                        vy += ny * force;
+                    }
+                }
+
+                if (Math.abs(vx) > 0.1 || Math.abs(vy) > 0.1) {
+                    moved = true;
+                    newStepPos[idA] = { x: posA.x + vx, y: posA.y + vy };
+                }
+            }
+            calculatedPos = newStepPos;
+            if (!moved) break;
+        }
+
+        setPositions(calculatedPos);
+    }, [territories]);
+
+    return positions;
+};
+
+
 export default function App() {
   const [gameState, setGameState] = useState<GameState | null>(null);
   
@@ -68,6 +139,12 @@ export default function App() {
   const [isLogOpen, setIsLogOpen] = useState(false);
   const [moveMenu, setMoveMenu] = useState<{from: string, to: string, types: UnitType[]} | null>(null);
   
+  // Visuals & Popups
+  const currentPositions = useNodePhysics(gameState?.territories || {});
+  const [activeAnnouncement, setActiveAnnouncement] = useState<'combat' | 'catastrophe' | null>(null);
+  const [combatResult, setCombatResult] = useState<CombatResult | undefined>(undefined);
+  const [catastropheResult, setCatastropheResult] = useState<CatastropheResult | undefined>(undefined);
+
   const svgRef = useRef<SVGSVGElement>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
@@ -82,7 +159,6 @@ export default function App() {
     });
   };
 
-  // Scroll to bottom of logs when opened or updated
   useEffect(() => {
     if (isLogOpen && logsEndRef.current) {
       logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
@@ -111,16 +187,18 @@ export default function App() {
           }
       }
 
+      const updatedPlayers = prev.players.map((p, idx) => ({
+          ...p,
+          movRest: idx === nextIndex && p.movRest > 0 ? p.movRest - 1 : p.movRest
+      }));
+
       return {
         ...prev,
         currentPlayerIndex: nextIndex,
         roundCount: nextRound,
         turnCount: nextTurn,
         isProcessing: false,
-        players: prev.players.map((p, idx) => ({
-          ...p,
-          movRest: idx === nextIndex && p.movRest > 0 ? p.movRest - 1 : p.movRest
-        }))
+        players: updatedPlayers
       };
     });
   }, []);
@@ -144,9 +222,14 @@ export default function App() {
       }
     }
     
-    const remainingPower = newTroops.peon + newTroops.horse * 5 + newTroops.tank * 10;
+    newTroops.peon = Math.max(0, newTroops.peon);
+    newTroops.horse = Math.max(0, newTroops.horse);
+    newTroops.tank = Math.max(0, newTroops.tank);
+
+    const remainingPower = newTroops.peon + (newTroops.horse * 5) + (newTroops.tank * 10);
     const newOwner = remainingPower <= 0 ? null : t.owner;
-    if (remainingPower <= 0) {
+    
+    if (newOwner === null) {
         newTroops.peon = 0; newTroops.horse = 0; newTroops.tank = 0;
     }
 
@@ -156,28 +239,35 @@ export default function App() {
   const handleCombat = (attackerId: string, defenderId: string) => {
     if (!gameState) return;
     
+    // Play combat sound
+    playSound('combat');
+
     const att = gameState.territories[attackerId];
     const def = gameState.territories[defenderId];
     const player = gameState.players[gameState.currentPlayerIndex];
+    const defenderPlayer = gameState.players.find(p => p.id === def.owner);
 
     const r1 = rollDice();
     const b1 = rollDice();
 
     let newDef = { ...def };
     let newAtt = { ...att };
+    let finalDamage = 0;
+    let isCounterAttack = false;
 
-    addLog(`⚔️ Combat at ${defenderId}: ${r1} (Att) vs ${b1} (Def)`, 'combat');
-
+    // Phase 1: Attacker strikes
     if (r1 > b1) {
       const dmg = r1 - b1;
+      finalDamage = dmg;
       const res = applyDamage(newDef, dmg);
       newDef.troops = res.troops;
       newDef.owner = res.owner;
-      addLog(`💥 Hit! Defender took ${dmg} damage.`, 'combat');
+      addLog(`⚔️ Combat at ${defenderId}: ${r1} (Att) vs ${b1} (Def). ${dmg} Dmg dealt.`, 'combat');
     } else {
-        addLog(`🛡️ Blocked by defender.`, 'combat');
+      addLog(`⚔️ Combat at ${defenderId}: ${r1} (Att) vs ${b1} (Def). Blocked.`, 'combat');
     }
 
+    // Phase 2: Counter Attack (if defender still stands)
     if (getTotalPower(newDef) > 0) {
       const r2 = rollDice();
       const b2 = rollDice();
@@ -188,11 +278,30 @@ export default function App() {
         newAtt.troops = res.troops;
         newAtt.owner = res.owner;
         addLog(`🗡️ Counter-hit! Attacker took ${dmg} damage.`, 'combat');
+        
+        // Show counter attack in popup if the initial attack failed or this was significant
+        if (finalDamage === 0) {
+            finalDamage = dmg;
+            isCounterAttack = true;
+        }
       }
     } else {
         addLog(`🏳️ Defender neutralized!`, 'info');
     }
 
+    // Trigger Popup
+    setCombatResult({
+        attackerName: player.name,
+        defenderName: defenderPlayer ? defenderPlayer.name : 'Neutral',
+        attackerRoll: r1,
+        defenderRoll: b1,
+        damageDealt: finalDamage,
+        isCounter: isCounterAttack,
+        location: defenderId
+    });
+    setActiveAnnouncement('combat');
+
+    // Slight delay to process state update so user can see the board before turn change
     setGameState(prev => {
         if(!prev) return null;
         return {
@@ -202,14 +311,20 @@ export default function App() {
                 [attackerId]: newAtt,
                 [defenderId]: newDef
             },
-            players: prev.players.map(p => p.id === player.id ? { ...p, movRest: 1 } : p)
+            players: prev.players.map(p => p.id === player.id ? { ...p, movRest: 1 } : p),
+            isProcessing: true // Block inputs while popup is showing
         }
     });
-    endTurn();
+
+    setTimeout(() => {
+        setGameState(prev => prev ? { ...prev, isProcessing: false } : null);
+        endTurn();
+    }, 2500); // 2.5s delay for popup viewing
   };
 
   const handleMove = (fromId: string, toId: string, unitType: UnitType) => {
     if (!gameState) return;
+    playSound('move');
     const player = gameState.players[gameState.currentPlayerIndex];
     
     setGameState(prev => {
@@ -250,9 +365,10 @@ export default function App() {
         if (!p.isAlive) return p;
         if (p.capital) {
             const capTerr = gameState.territories[p.capital];
-            if (capTerr.owner === p.id && getTotalPower(capTerr) > 0) {
-                return p;
+            if (capTerr.owner !== p.id || getTotalPower(capTerr) <= 0) {
+                 return { ...p, isAlive: false, capital: null };
             }
+            return p;
         }
         return { ...p, isAlive: false, capital: null };
     });
@@ -265,6 +381,7 @@ export default function App() {
     }
 
     if (activePlayers <= 1 && gameState.players.length > 0) {
+        playSound('win');
         const winner = newPlayers.find(p => p.isAlive);
         setGameState(prev => prev ? { ...prev, winner: winner ? winner.id : 'draw' } : null);
     }
@@ -279,9 +396,11 @@ export default function App() {
   const triggerCatastrophe = () => {
       if (!gameState) return;
       
+      playSound('catastrophe');
       addLog(`⚡ Catastrophe Event (Round ${gameState.roundCount})`, 'event');
       
       let newTerritories = { ...gameState.territories };
+      const eventDetails: CatastropheResult['details'] = [];
 
       gameState.players.forEach(p => {
           if (!p.isAlive || !p.capital || newTerritories[p.capital].owner !== p.id) return;
@@ -292,6 +411,8 @@ export default function App() {
           if (dr > db) {
               let loss = dr - db;
               addLog(`${p.name}: Plague! Losing ${loss} power.`, 'event');
+              eventDetails.push({ playerId: p.id, playerName: p.name, type: 'plague', amount: loss });
+              
               let attempts = 0;
               while (loss > 0 && attempts < 50) {
                   const pTerrs = Object.values(newTerritories).filter(t => t.owner === p.id && getTotalPower(t) > 0);
@@ -305,13 +426,23 @@ export default function App() {
           } else if (db > dr) {
               const gain = db - dr;
               addLog(`${p.name}: Prosperity! +${gain} Peons in Capital.`, 'event');
+              eventDetails.push({ playerId: p.id, playerName: p.name, type: 'prosperity', amount: gain });
               newTerritories[p.capital].troops.peon += gain;
           } else {
             addLog(`${p.name}: No change.`, 'event');
+            eventDetails.push({ playerId: p.id, playerName: p.name, type: 'neutral', amount: 0 });
           }
       });
 
-      setGameState(prev => prev ? { ...prev, territories: newTerritories } : null);
+      // Show popup
+      setCatastropheResult({ round: gameState.roundCount, details: eventDetails });
+      setActiveAnnouncement('catastrophe');
+
+      setGameState(prev => prev ? { ...prev, territories: newTerritories, isProcessing: true } : null);
+      
+      setTimeout(() => {
+        setGameState(prev => prev ? { ...prev, isProcessing: false } : null);
+      }, 3000);
   };
   
   const prevRoundRef = useRef(1);
@@ -323,14 +454,24 @@ export default function App() {
           prevRoundRef.current = gameState.roundCount;
       }
       checkVictory();
-  }, [gameState?.roundCount, gameState?.turnCount]);
+  }, [gameState?.roundCount, gameState?.turnCount, gameState?.territories]); 
 
 
-  // --- AI ---
+  // --- COOLDOWN & AI MANAGEMENT ---
   useEffect(() => {
     if (!gameState || gameState.winner) return;
     const player = gameState.players[gameState.currentPlayerIndex];
     
+    // --- HUMAN COOLDOWN SKIPPER ---
+    if (!player.isAi && player.movRest > 0 && !gameState.isProcessing) {
+         setGameState(prev => prev ? { ...prev, isProcessing: true } : null);
+         setTimeout(() => {
+             addLog(`${player.name} is resting... (${player.movRest} left)`);
+             endTurn();
+         }, 1000);
+         return;
+    }
+
     if (player.isAi && !gameState.isProcessing) {
         
         // --- AI SETUP ---
@@ -351,6 +492,7 @@ export default function App() {
                             isProcessing: false
                         };
                      });
+                     playSound('capital');
                      addLog(`${player.name} selected Capital ${pick.id}`);
                      endTurn();
                  }
@@ -364,6 +506,7 @@ export default function App() {
         }
 
         if (player.movRest > 0) {
+            setGameState(prev => prev ? { ...prev, isProcessing: true } : null);
             setTimeout(() => {
                 addLog("AI Resting...", 'info');
                 endTurn();
@@ -389,6 +532,7 @@ export default function App() {
                     t.troops.peon += 1;
                     return { ...prev, territories: { ...prev.territories, [player.capital!]: t }, players: prev.players.map(p => p.id === player.id ? {...p, movRest: 1} : p) };
                 });
+                playSound('recruit');
                 addLog("AI Recruited at Capital", 'info');
                 endTurn();
                 return;
@@ -428,6 +572,7 @@ export default function App() {
                     t.troops.peon += 1;
                     return { ...prev, territories: { ...prev.territories, [player.capital!]: t }, players: prev.players.map(p => p.id === player.id ? {...p, movRest: 1} : p) };
                 });
+                playSound('recruit');
                 addLog("AI Recruited (Idle)", 'info');
                 endTurn();
             }
@@ -441,6 +586,7 @@ export default function App() {
 
   const handleNodeClick = (nodeId: string) => {
     if (!gameState) return;
+    playSound('click');
     const player = gameState.players[gameState.currentPlayerIndex];
     
     if (gameState.turnCount < 2 && !player.isAi) {
@@ -456,6 +602,7 @@ export default function App() {
                      players: updatedPlayers
                  };
              });
+             playSound('capital');
              addLog(`${player.name} selected Capital ${nodeId}`);
              endTurn();
         } else {
@@ -476,6 +623,7 @@ export default function App() {
     if (getTotalPower(gameState.territories[nodeId]) <= 0) return;
     if (player.movRest > 0) return;
 
+    playSound('select');
     setDragStart(nodeId);
   };
 
@@ -537,6 +685,7 @@ export default function App() {
                     players: prev.players.map(p => p.id === player.id ? { ...p, movRest: 1 } : p)
                 };
             });
+            playSound('recruit');
             addLog("Recruited reinforcement");
             endTurn();
       }
@@ -567,6 +716,7 @@ export default function App() {
               territories: { ...prev.territories, [tId]: newT },
               players: prev.players.map(p => p.id === player.id ? { ...p, movRest: 1 } : p)
           } : null);
+          playSound('fuse');
           addLog("Fusion successful.");
           endTurn();
       } else {
@@ -579,6 +729,12 @@ export default function App() {
       const player = gameState.players[gameState.currentPlayerIndex];
       const t = gameState.territories[gameState.selectedNode];
       
+      // FIX 1: Prevent moving capital to itself
+      if (t.id === player.capital) {
+          addLog("Capital is already here.", 'error');
+          return;
+      }
+
       // Check if another player has a capital here
       const isExistingCapital = gameState.players.some(p => p.capital === t.id && p.id !== player.id);
 
@@ -592,6 +748,7 @@ export default function App() {
               ...prev,
               players: prev.players.map(p => p.id === player.id ? { ...p, capital: t.id, movRest: 3 } : p)
           } : null);
+          playSound('capital');
           addLog("Capital moved to " + t.id);
           endTurn();
       } else {
@@ -599,7 +756,17 @@ export default function App() {
       }
   };
 
+  const handleSurrender = () => {
+      if (!gameState) return;
+      const opponent = gameState.players.find(p => p.id !== gameState.players[gameState.currentPlayerIndex].id);
+      if (opponent) {
+          playSound('win');
+          setGameState(prev => prev ? { ...prev, winner: opponent.id } : null);
+      }
+  };
+
   const startGame = (vsAi: boolean) => {
+      playSound('select');
       setGameState(createInitialState(vsAi, configInterval));
   };
 
@@ -644,6 +811,7 @@ export default function App() {
   }
 
   const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+  // Note: We changed isMyTurn logic slightly, if resting, input is blocked, but the effect will auto-skip
   const isMyTurn = !currentPlayer.isAi && !gameState.winner && !gameState.isProcessing && currentPlayer.movRest === 0;
 
   return (
@@ -653,6 +821,13 @@ export default function App() {
          onMouseUp={handleDragEnd}
          onTouchEnd={handleDragEnd}
     >
+      <AnnouncementOverlay 
+        type={activeAnnouncement} 
+        combatData={combatResult} 
+        catastropheData={catastropheResult}
+        onClose={() => setActiveAnnouncement(null)}
+      />
+
       {/* MAP SVG */}
       <svg 
         ref={svgRef}
@@ -662,8 +837,12 @@ export default function App() {
       >
         {/* Edges */}
         {EDGES.map(([a, b], idx) => {
-            const p1 = MAP_POSITIONS[a];
-            const p2 = MAP_POSITIONS[b];
+            // Use current physics positions for edges
+            const p1 = currentPositions[a];
+            const p2 = currentPositions[b];
+            // If positions aren't ready (init), use static.
+            if (!p1 || !p2) return null;
+            
             return (
                 <line 
                     key={`${a}-${b}`} 
@@ -671,15 +850,16 @@ export default function App() {
                     stroke="#cbd5e1" 
                     strokeWidth="4" 
                     strokeLinecap="round"
+                    className="transition-all duration-300 ease-out"
                 />
             );
         })}
 
         {/* Drag Line */}
-        {dragStart && (
+        {dragStart && currentPositions[dragStart] && (
             <line 
-                x1={MAP_POSITIONS[dragStart].x} 
-                y1={MAP_POSITIONS[dragStart].y}
+                x1={currentPositions[dragStart].x} 
+                y1={currentPositions[dragStart].y}
                 x2={mousePos.x}
                 y2={mousePos.y}
                 stroke={gameState.players[gameState.currentPlayerIndex].color}
@@ -692,7 +872,9 @@ export default function App() {
 
         {/* Nodes */}
         {Object.entries(gameState.territories).map(([id, t]) => {
-            const pos = MAP_POSITIONS[id];
+            const pos = currentPositions[id];
+            if (!pos) return null;
+
             const owner = t.owner ? gameState.players.find(p => p.id === t.owner) : null;
             const isCapital = gameState.players.some(p => p.capital === id && p.isAlive);
             const isSelected = gameState.selectedNode === id;
@@ -762,13 +944,22 @@ export default function App() {
 
       {/* HUD - TOP BAR */}
       <div className="absolute top-0 left-0 w-full p-4 flex justify-between items-start pointer-events-none">
-          <div className="bg-white/80 backdrop-blur-md px-4 py-2 rounded-2xl shadow-sm border border-white/50 pointer-events-auto">
-              <div className="text-xs font-bold text-slate-400 tracking-wider uppercase mb-1">Current Turn</div>
-              <div className="flex items-center gap-2">
-                  <div className={`w-3 h-3 rounded-full ${currentPlayer.id === 1 ? 'bg-blue-500' : 'bg-rose-500'}`} />
-                  <span className="font-semibold text-slate-800">{currentPlayer.name}</span>
-                  {currentPlayer.movRest > 0 && <span className="text-xs bg-slate-200 px-2 py-0.5 rounded text-slate-600">Resting ({currentPlayer.movRest})</span>}
+          <div className="bg-white/80 backdrop-blur-md px-4 py-2 rounded-2xl shadow-sm border border-white/50 pointer-events-auto flex items-center gap-4">
+              <div className="flex flex-col">
+                <div className="text-xs font-bold text-slate-400 tracking-wider uppercase mb-1">Current Turn</div>
+                <div className="flex items-center gap-2">
+                    <div className={`w-3 h-3 rounded-full ${currentPlayer.id === 1 ? 'bg-blue-500' : 'bg-rose-500'}`} />
+                    <span className="font-semibold text-slate-800">{currentPlayer.name}</span>
+                    {currentPlayer.movRest > 0 && <span className="text-xs bg-slate-200 px-2 py-0.5 rounded text-slate-600 animate-pulse">Resting ({currentPlayer.movRest})</span>}
+                </div>
               </div>
+              
+              {/* Surrender Button */}
+              {isMyTurn && (
+                  <button onClick={handleSurrender} className="p-2 bg-slate-100 hover:bg-rose-100 text-slate-400 hover:text-rose-600 rounded-full transition-colors" title="Surrender">
+                      <Flag size={16} />
+                  </button>
+              )}
           </div>
 
           <div className="bg-white/80 backdrop-blur-md px-4 py-2 rounded-2xl shadow-sm border border-white/50 text-right">
@@ -816,16 +1007,29 @@ export default function App() {
                         <span className="text-[9px] font-medium">Recruit</span>
                     </button>
                     <div className="w-px bg-slate-200 my-2"></div>
-                    <button onClick={() => fuse('A')} className="flex flex-col items-center justify-center w-14 h-14 rounded-xl hover:bg-slate-100 disabled:opacity-30 transition text-slate-700">
-                        <div className="flex text-[9px] mb-1"><UnitIcon type="peon" color="#334155" size={10} />x5</div>
-                        <span className="text-[9px] font-medium">Fuse H</span>
-                    </button>
-                    <button onClick={() => fuse('B')} className="flex flex-col items-center justify-center w-14 h-14 rounded-xl hover:bg-slate-100 disabled:opacity-30 transition text-slate-700">
-                        <div className="flex text-[9px] mb-1"><UnitIcon type="horse" color="#334155" size={10} />x2</div>
-                        <span className="text-[9px] font-medium">Fuse T</span>
-                    </button>
+                    
+                    {/* Fusion Group */}
+                    <div className="flex gap-1">
+                        <button onClick={() => fuse('A')} className="flex flex-col items-center justify-center w-12 h-14 rounded-xl hover:bg-slate-100 disabled:opacity-30 transition text-slate-700" title="5 Peons -> 1 Horse">
+                            <div className="flex text-[9px] mb-1"><UnitIcon type="peon" color="#334155" size={10} />x5</div>
+                            <span className="text-[9px] font-medium">Fuse H</span>
+                        </button>
+                        <button onClick={() => fuse('B')} className="flex flex-col items-center justify-center w-12 h-14 rounded-xl hover:bg-slate-100 disabled:opacity-30 transition text-slate-700" title="2 Horses -> 1 Tank">
+                            <div className="flex text-[9px] mb-1"><UnitIcon type="horse" color="#334155" size={10} />x2</div>
+                            <span className="text-[9px] font-medium">Fuse T</span>
+                        </button>
+                        <button onClick={() => fuse('C')} className="flex flex-col items-center justify-center w-12 h-14 rounded-xl hover:bg-slate-100 disabled:opacity-30 transition text-slate-700" title="10 Peons -> 1 Tank">
+                            <div className="flex text-[9px] mb-1"><UnitIcon type="peon" color="#334155" size={10} />x10</div>
+                            <span className="text-[9px] font-medium">Fuse P</span>
+                        </button>
+                    </div>
+
                     <div className="w-px bg-slate-200 my-2"></div>
-                    <button onClick={moveCapital} className="flex flex-col items-center justify-center w-14 h-14 rounded-xl hover:bg-slate-100 disabled:opacity-30 transition text-slate-700">
+                    <button 
+                        onClick={moveCapital} 
+                        disabled={getTotalPower(gameState.territories[gameState.selectedNode]) < 10 || gameState.selectedNode === currentPlayer.capital}
+                        className="flex flex-col items-center justify-center w-14 h-14 rounded-xl hover:bg-slate-100 disabled:opacity-30 disabled:hover:bg-transparent transition text-slate-700"
+                    >
                         <MapPin size={18} className="mb-1" />
                         <span className="text-[9px] font-medium">Set Cap</span>
                     </button>
